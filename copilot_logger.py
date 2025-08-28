@@ -10,6 +10,13 @@ ALLOWED_HOSTS = {
     "proxy.individual.githubcopilot.com",
 }
 
+# --- Configuration ---
+# Set these to True to save the full request/response bodies and headers.
+# WARNING: This can create very large log files.
+SAVE_BODIES = False
+SAVE_HEADERS = False
+# --- End Configuration ---
+
 BASE_DIR = pathlib.Path(os.path.expanduser("~/.mitmproxy/intercepter_vscode/copilot_mitm"))
 EVENTS_PATH = BASE_DIR / "events.jsonl"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -18,15 +25,6 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _is_copilot_host(host: str) -> bool:
     return host in ALLOWED_HOSTS
-
-def _is_textual(ct: str) -> bool:
-    ct = (ct or "").lower()
-    return (
-        "application/json" in ct
-        or "text/" in ct
-        or "application/javascript" in ct
-        or "application/x-ndjson" in ct
-    )
 
 def _looks_like_sse(ct: str) -> bool:
     return "text/event-stream" in (ct or "").lower()
@@ -50,6 +48,41 @@ def _safe_json(b: Optional[bytes]) -> Optional[dict]:
         return json.loads(b)
     except json.JSONDecodeError:
         return {"error": "invalid json", "content": _decode(b)[:1000]}
+
+def _summarize_req_json(data: Optional[dict]) -> Optional[dict]:
+    """Removes large message content from request JSON to save space."""
+    if not data or not isinstance(data, dict):
+        return data
+    
+    summary = data.copy()
+    if "messages" in summary and isinstance(summary["messages"], list):
+        # Keep message metadata but remove the large content
+        summary["messages"] = [
+            {k: v for k, v in msg.items() if k != "content"}
+            for msg in summary["messages"]
+        ]
+    return summary
+
+def _summarize_req_json(data: Optional[dict]) -> Optional[dict]:
+    """Removes large message content from request JSON to save space."""
+    if not data or not isinstance(data, dict):
+        return data
+    
+    summary = data.copy()
+    if "messages" in summary and isinstance(summary["messages"], list):
+        # Keep message metadata but remove the large content
+        summary["messages"] = [
+            {k: v for k, v in msg.items() if k != "content"}
+            for msg in summary["messages"]
+        ]
+    
+    if "prediction" in summary and isinstance(summary["prediction"], dict):
+        # Also remove the large content from inline predictions
+        new_prediction = summary["prediction"].copy()
+        new_prediction.pop("content", None)
+        summary["prediction"] = new_prediction
+        
+    return summary
 
 def _reconstruct_sse_response(chunks: list[str]) -> dict:
     """Reconstructs a single JSON response from a list of SSE data chunks."""
@@ -166,9 +199,10 @@ class CopilotLogger:
         t_resp_end = flow.response.timestamp_end
 
         ttfb = _safe_float((t_resp_start - t_req) if (t_resp_start and t_req) else None)
-        total = _safe_float((t_resp_end - t_req) if (t_resp_end and t_req) else None)
+        latency_total = _safe_float((t_resp_end - t_req) if (t_resp_end and t_req) else None)
 
         # Sizes
+        req_bytes = len(flow.request.raw_content or b"")
         req_bytes = len(flow.request.raw_content or b"")
         # If we streamed SSE, raw_content may be empty—use counter
         is_sse = "sse_chunks" in flow.metadata
@@ -180,42 +214,54 @@ class CopilotLogger:
         req_ct = flow.request.headers.get("content-type", "")
         resp_ct = flow.response.headers.get("content-type", "")
 
-        # Handle response body persistence
+        # Handle request and response bodies
+        req_json_full = _safe_json(flow.request.raw_content) if ("application/json" in req_ct) else None
         final_resp_json = None
 
         if is_sse:
             # Reconstruct the single aggregated JSON for SSE
-            reconstructed_json = _reconstruct_sse_response(flow.metadata["sse_chunks"])
-            final_resp_json = reconstructed_json
+            final_resp_json = _reconstruct_sse_response(flow.metadata["sse_chunks"])
         elif "application/json" in resp_ct:
             final_resp_json = _safe_json(flow.response.raw_content)
 
+        # Extract token usage if available
+        usage = (final_resp_json or {}).get("usage") or {}
+
+        # Decide what to save based on config
+        req_json_to_save = req_json_full if SAVE_BODIES else _summarize_req_json(req_json_full)
+        resp_json_to_save = final_resp_json if SAVE_BODIES else _summarize_resp_json(final_resp_json)
+
         # Write the summary event
-        rec = {
+        rec: dict[str, any] = {
             "ts_end": t_resp_end,
             "method": flow.request.method,
             "host": flow.request.host,
             "path": flow.request.path,
             "status": flow.response.status_code,
             "ttfb_s": ttfb,
-            "latency_total_s": total,
+            "latency_total_s": latency_total,
             "req_bytes": req_bytes,
             "resp_bytes": resp_bytes,
             "req_ct": req_ct,
             "resp_ct": resp_ct,
-            "req_headers": dict(flow.request.headers),
-            "resp_headers": dict(flow.response.headers),
-            "req_json": _safe_json(flow.request.raw_content) if ("application/json" in req_ct) else None,
-            "resp_json": final_resp_json,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "req_json": req_json_to_save,
+            "resp_json": resp_json_to_save,
         }
+
+        if SAVE_HEADERS:
+            rec["req_headers"] = dict(flow.request.headers)
+            rec["resp_headers"] = dict(flow.response.headers)
 
         with open(EVENTS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
         ctx.log.info(
             f"[Copilot] {flow.request.method} {flow.request.host}{flow.request.path} -> {flow.response.status_code} | "
-            f"total: {total or 0:.2f}s, ttfb: {ttfb or 0:.2f}s, "
-            f"req: {req_bytes}b, resp: {resp_bytes}b"
+            f"total: {latency_total or 0:.2f}s, ttfb: {ttfb or 0:.2f}s, "
+            f"req: {req_bytes}b, resp: {resp_bytes}b, tokens: {usage.get('total_tokens', 'N/A')}"
         )
 
 addons = [CopilotLogger()]
