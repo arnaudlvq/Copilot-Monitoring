@@ -60,6 +60,15 @@ def _safe_float(x: Optional[float]) -> Optional[float]:
     except Exception:
         return None
 
+def _safe_json(b: Optional[bytes]) -> Optional[dict]:
+    if not b:
+        return None
+    try:
+        return json.loads(b)
+    except json.JSONDecodeError:
+        return {"error": "invalid json", "content": _decode(b)[:1000]}
+
+
 # -------- addon
 
 class CopilotLogger:
@@ -128,7 +137,8 @@ class CopilotLogger:
         resp_ct = flow.response.headers.get("content-type", "")
 
         # If not SSE and textual, persist full response body now
-        if not _looks_like_sse(resp_ct) and _is_textual(resp_ct):
+        # The check for `sse_bytes` ensures we don't overwrite a streamed response.
+        if flow.metadata.get("sse_bytes") is None and _is_textual(resp_ct):
             resp_path = pathlib.Path(flow.metadata.get("resp_path") or _new_paths(flow)[1])
             flow.metadata["resp_path"] = str(resp_path)
             if flow.response.raw_content:
@@ -147,14 +157,16 @@ class CopilotLogger:
             "resp_bytes": resp_bytes,
             "req_ct": req_ct,
             "resp_ct": resp_ct,
-            "req_json_snippet": (json.dumps(_safe_json(flow.request.raw_content))[:2000] + "...") if ("application/json" in req_ct) else None,
-            "resp_json_snippet": (json.dumps(_safe_json(flow.response.raw_content))[:2000] + "...") if ("application/json" in resp_ct) else None,
+            "req_path": flow.metadata.get("req_path"),
+            "resp_path": flow.metadata.get("resp_path"),
+            "req_json": _safe_json(flow.request.raw_content) if ("application/json" in req_ct) else None,
+            "resp_json": _safe_json(flow.response.raw_content) if ("application/json" in resp_ct) else None,
         }
 
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
+        with open(EVENTS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         # Add this to your CopilotLogger.request method:
         ctx.log.info(f"Host seen: {flow.request.host}")
         ctx.log.info(f"[Copilot] {flow.request.method} {flow.request.path} "
-                     f"-> {flow.response.status_code}  total={latency_total:.3f}s ttft={ttft:.3f}s")
+                     f"-> {flow.response.status_code}  total={total or 0:.3f}s ttft={ttfb or 0:.3f}s")
 addons = [CopilotLogger()]
