@@ -11,8 +11,10 @@ ALLOWED_HOSTS = {
 }
 
 BASE_DIR = pathlib.Path(os.path.expanduser("~/.mitmproxy/intercepter_vscode/copilot_mitm"))
+LOG_DIR = BASE_DIR / "bodies"
 EVENTS_PATH = BASE_DIR / "events.jsonl"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------- helpers
 
@@ -37,6 +39,21 @@ def _decode(b: Optional[bytes]) -> str:
     # Never raise—replace errors so we keep as much text as possible
     return b.decode("utf-8", errors="replace")
 
+def _write(path: pathlib.Path, data: str, mode: str = "a"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, mode, encoding="utf-8") as f:
+        f.write(data)
+
+def _new_paths(flow: http.HTTPFlow):
+    # Stable, human-friendly names: timestamp + last 8 of flow id
+    t = int(time.time())
+    short = flow.id[-8:]
+    base = f"{t}_{short}"
+    return (
+        LOG_DIR / f"{base}_req.txt",
+        LOG_DIR / f"{base}_resp.txt",
+    )
+
 def _safe_float(x: Optional[float]) -> Optional[float]:
     try:
         return float(x) if x is not None else None
@@ -51,55 +68,6 @@ def _safe_json(b: Optional[bytes]) -> Optional[dict]:
     except json.JSONDecodeError:
         return {"error": "invalid json", "content": _decode(b)[:1000]}
 
-def _reconstruct_sse_response(chunks: list[str]) -> dict:
-    """Reconstructs a single JSON response from a list of SSE data chunks."""
-    full_content = ""
-    role = None
-    finish_reason = None
-    usage = None
-    metadata = {}
-
-    for chunk_str in chunks:
-        if not chunk_str.strip():
-            continue
-        try:
-            data = json.loads(chunk_str)
-            if not metadata: # Capture metadata from the first valid chunk
-                metadata = {k: v for k, v in data.items() if k != "choices"}
-
-            choices = data.get("choices")
-            if not choices:  # Gracefully skip chunks with no choices (e.g. metadata chunks)
-                continue
-
-            choice = choices[0]
-            delta = choice.get("delta", {})
-
-            if "role" in delta and delta["role"]:
-                role = delta["role"]
-            if "content" in delta and delta["content"]:
-                full_content += delta["content"]
-            if choice.get("finish_reason"):
-                finish_reason = choice.get("finish_reason")
-            if data.get("usage"):
-                usage = data.get("usage")
-
-        except json.JSONDecodeError:
-            ctx.log.warn(f"SSE: Could not parse JSON chunk: {chunk_str[:100]}")
-
-    # Assemble the final, consolidated response object
-    final_response = {
-        **metadata,
-        "object": "chat.completion.aggregated",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": role, "content": full_content},
-                "finish_reason": finish_reason,
-            }
-        ],
-        "usage": usage,
-    }
-    return final_response
 
 # -------- addon
 
@@ -107,6 +75,17 @@ class CopilotLogger:
     def request(self, flow: http.HTTPFlow):
         if not _is_copilot_host(flow.request.host):
             return
+
+        # Allocate per-flow file paths once
+        req_path, resp_path = _new_paths(flow)
+        flow.metadata["req_path"] = str(req_path)
+        flow.metadata["resp_path"] = str(resp_path)
+
+        # Persist textual request body
+        req_ct = flow.request.headers.get("content-type", "")
+        if _is_textual(req_ct):
+            _write(req_path, _decode(flow.request.raw_content))
+
         # Mark request start (mitmproxy already tracks timestamp_start, we keep this as fallback)
         flow.metadata["t_req_start_meta"] = time.time()
 
@@ -119,39 +98,17 @@ class CopilotLogger:
 
         resp_ct = flow.response.headers.get("content-type", "")
         if _looks_like_sse(resp_ct):
+            resp_path = pathlib.Path(flow.metadata.get("resp_path") or _new_paths(flow)[1])
+            flow.metadata["resp_path"] = str(resp_path)
             flow.metadata["sse_bytes"] = 0
-            flow.metadata["sse_chunks"] = [] # Store chunks for later processing
-            flow.metadata["sse_buffer"] = "" # Buffer for incomplete lines
 
             def on_chunk(chunk: bytes):
                 # End-of-stream marker in mitmproxy is b""
                 if chunk == b"":
-                    # Process any remaining data in the buffer
-                    if flow.metadata["sse_buffer"]:
-                        line = flow.metadata["sse_buffer"]
-                        if line.startswith("data: "):
-                            data_part = line[len("data: "):].strip()
-                            if data_part and data_part != "[DONE]":
-                                flow.metadata["sse_chunks"].append(data_part)
                     return chunk
-
+                txt = _decode(chunk)
+                _write(resp_path, txt)
                 flow.metadata["sse_bytes"] = flow.metadata.get("sse_bytes", 0) + len(chunk)
-                
-                # Add new data to buffer and split by newline
-                data = flow.metadata["sse_buffer"] + _decode(chunk)
-                lines = data.split("\n")
-                
-                # The last part might be incomplete, so it becomes the new buffer
-                flow.metadata["sse_buffer"] = lines.pop()
-
-                # Process all complete lines
-                for line in lines:
-                    line = line.strip()
-                    if line.startswith("data: "):
-                        data_part = line[len("data: "):].strip()
-                        if data_part and data_part != "[DONE]":
-                            flow.metadata["sse_chunks"].append(data_part)
-                
                 return chunk  # pass-through unmodified
 
             flow.response.stream = on_chunk
@@ -171,8 +128,7 @@ class CopilotLogger:
         # Sizes
         req_bytes = len(flow.request.raw_content or b"")
         # If we streamed SSE, raw_content may be empty—use counter
-        is_sse = "sse_chunks" in flow.metadata
-        if is_sse:
+        if flow.metadata.get("sse_bytes") is not None:
             resp_bytes = flow.metadata.get("sse_bytes", 0)
         else:
             resp_bytes = len(flow.response.raw_content or b"")
@@ -180,15 +136,13 @@ class CopilotLogger:
         req_ct = flow.request.headers.get("content-type", "")
         resp_ct = flow.response.headers.get("content-type", "")
 
-        # Handle response body persistence
-        final_resp_json = None
-
-        if is_sse:
-            # Reconstruct the single aggregated JSON for SSE
-            reconstructed_json = _reconstruct_sse_response(flow.metadata["sse_chunks"])
-            final_resp_json = reconstructed_json
-        elif "application/json" in resp_ct:
-            final_resp_json = _safe_json(flow.response.raw_content)
+        # If not SSE and textual, persist full response body now
+        # The check for `sse_bytes` ensures we don't overwrite a streamed response.
+        if flow.metadata.get("sse_bytes") is None and _is_textual(resp_ct):
+            resp_path = pathlib.Path(flow.metadata.get("resp_path") or _new_paths(flow)[1])
+            flow.metadata["resp_path"] = str(resp_path)
+            if flow.response.raw_content:
+                _write(resp_path, _decode(flow.response.raw_content), mode="w")
 
         # Write the summary event
         rec = {
@@ -203,19 +157,16 @@ class CopilotLogger:
             "resp_bytes": resp_bytes,
             "req_ct": req_ct,
             "resp_ct": resp_ct,
-            "req_headers": dict(flow.request.headers),
-            "resp_headers": dict(flow.response.headers),
+            "req_path": flow.metadata.get("req_path"),
+            "resp_path": flow.metadata.get("resp_path"),
             "req_json": _safe_json(flow.request.raw_content) if ("application/json" in req_ct) else None,
-            "resp_json": final_resp_json,
+            "resp_json": _safe_json(flow.response.raw_content) if ("application/json" in resp_ct) else None,
         }
 
         with open(EVENTS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-        ctx.log.info(
-            f"[Copilot] {flow.request.method} {flow.request.host}{flow.request.path} -> {flow.response.status_code} | "
-            f"total: {total or 0:.2f}s, ttfb: {ttfb or 0:.2f}s, "
-            f"req: {req_bytes}b, resp: {resp_bytes}b"
-        )
-
+        # Add this to your CopilotLogger.request method:
+        ctx.log.info(f"Host seen: {flow.request.host}")
+        ctx.log.info(f"[Copilot] {flow.request.method} {flow.request.path} "
+                     f"-> {flow.response.status_code}  total={total or 0:.3f}s ttft={ttfb or 0:.3f}s")
 addons = [CopilotLogger()]
