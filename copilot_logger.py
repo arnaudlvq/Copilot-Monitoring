@@ -147,18 +147,14 @@ class CopilotLogger:
             "resp_bytes": resp_bytes,
             "req_ct": req_ct,
             "resp_ct": resp_ct,
-            # pointers to where the actual text bodies live (if any)
-            "req_text_path": flow.metadata.get("req_path"),
-            "resp_text_path": flow.metadata.get("resp_path"),
+            "req_json_snippet": (json.dumps(_safe_json(flow.request.raw_content))[:2000] + "...") if ("application/json" in req_ct) else None,
+            "resp_json_snippet": (json.dumps(_safe_json(flow.response.raw_content))[:2000] + "...") if ("application/json" in resp_ct) else None,
         }
-        _write(EVENTS_PATH, json.dumps(rec, ensure_ascii=False) + "\n")
 
-        # Lightweight log line
-        ttfb_str = f"{ttfb:.3f}s" if ttfb is not None else "n/a"
-        total_str = f"{total:.3f}s" if total is not None else "n/a"
-        ctx.log.info(
-            f"[Copilot] {flow.request.method} {flow.request.host}{flow.request.path} "
-            f"-> {flow.response.status_code}  TTFB={ttfb_str} total={total_str}"
-        )
-
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # Add this to your CopilotLogger.request method:
+        ctx.log.info(f"Host seen: {flow.request.host}")
+        ctx.log.info(f"[Copilot] {flow.request.method} {flow.request.path} "
+                     f"-> {flow.response.status_code}  total={latency_total:.3f}s ttft={ttft:.3f}s")
 addons = [CopilotLogger()]
