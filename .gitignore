@@ -3,3 +3,5 @@
 *.jsonl
 
 copilot_mitm
+
+node_modules
