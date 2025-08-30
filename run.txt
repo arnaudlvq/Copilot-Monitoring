@@ -1,3 +1,0 @@
-mitmdump -p 8080 -s ~/.mitmproxy/intercepter_vscode/copilot_logger.py --allow-hosts '.*githubcopilot\.com'
-
-alias logger='mitmdump -p 8080 -s ~/.mitmproxy/intercepter_vscode/copilot_logger.py --allow-hosts ".*githubcopilot\.com"'
