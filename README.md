@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+<img width="1347" height="676" alt="Capture d’écran 2025-09-10 à 23 04 25" src="https://github.com/user-attachments/assets/072a7e5d-a6f0-43f2-8194-f393b16b7da4" />
+
 A beautiful, real-time dashboard to monitor your local GitHub Copilot API usage. Understand your token consumption, track performance metrics, and get a visual representation of your activity.
 
 ---
