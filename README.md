@@ -18,6 +18,8 @@ A beautiful, real-time dashboard to monitor your local GitHub Copilot API usage.
 *   **Historical View**: A calendar heatmap visualizes your token usage over the past year.
 *   **Tech Stack**: Built with `mitmproxy`, `FastAPI` (Python), and `React/TypeScript` (Vite).
 
+<img width="1324" height="750" alt="Capture d’écran 2025-09-10 à 23 05 10" src="https://github.com/user-attachments/assets/9cc9664f-aa97-4f2e-81aa-cee75b6a507f" />
+
 ## 🛠️ Installation & Setup
 
 Follow these steps to get your monitoring dashboard up and running.
