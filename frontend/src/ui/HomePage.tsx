@@ -40,7 +40,6 @@ interface CopilotEvent {
     resp_ct: string;
     req_json: {
         model?: string;
-        // For completion requests which have tokens in `extra`
         extra?: {
             prompt_tokens?: number;
         }
@@ -99,7 +98,7 @@ const InstantConsumptionPanel: React.FC<ConsumptionProps> = ({ events }) => {
         tokensLastHour: 0,
         requestsLastHour: 0,
         avgTokensPerRequest: 0,
-        trend: 0
+        trend: 0,
     });
     const [animateIn, setAnimateIn] = useState(false);
 
@@ -117,7 +116,7 @@ const InstantConsumptionPanel: React.FC<ConsumptionProps> = ({ events }) => {
             const requestsLastHour = recentEvents.length;
             const tokensLastHour = recentEvents.reduce((acc, event) => {
                 const usage = event.resp_json?.usage;
-                const promptTokens = usage?.prompt_tokens ?? event.req_json?.extra?.prompt_tokens ?? 0;
+                const promptTokens = usage?.prompt_tokens ?? 0;
                 const completionTokens = usage?.completion_tokens ?? 0;
                 const reasoningTokens = usage?.reasoning_tokens ?? 0;
                 return acc + (usage?.total_tokens ?? (promptTokens + completionTokens + reasoningTokens));
@@ -125,18 +124,18 @@ const InstantConsumptionPanel: React.FC<ConsumptionProps> = ({ events }) => {
 
             const tokensLast5Min = veryRecentEvents.reduce((acc, event) => {
                 const usage = event.resp_json?.usage;
-                const promptTokens = usage?.prompt_tokens ?? event.req_json?.extra?.prompt_tokens ?? 0;
+                const promptTokens = usage?.prompt_tokens ?? 0;
                 const completionTokens = usage?.completion_tokens ?? 0;
                 const reasoningTokens = usage?.reasoning_tokens ?? 0;
                 return acc + (usage?.total_tokens ?? (promptTokens + completionTokens + reasoningTokens));
             }, 0);
-
+            
             // Calculate consumption score (weighted formula)
             const calculatedScore = (tokensLastHour / 100) + (requestsLastHour * 30);
 
             // Calculate trend (comparing last 5 min to previous 5 min)
             const trend = tokensLast5Min * 2 - tokensLastHour;
-
+    
             setMetrics({
                 score: calculatedScore,
                 tokensLastHour,
@@ -222,6 +221,7 @@ const InstantConsumptionPanel: React.FC<ConsumptionProps> = ({ events }) => {
                             {metrics.trend > 0 ? 'Increasing' : 'Decreasing'}
                         </span>
                     </div>
+                    <p className="text-xs text-gray-500 mt-2">(Tokens/100) + (Requests*30)</p>
                 </div>
 
                 {/* Tokens Card */}
@@ -304,6 +304,63 @@ const HomePage: React.FC = () => {
     const [heatmapData, setHeatmapData] = useState<HeatmapData[]>([]);
     const [error, setError] = useState<string | null>(null);
 
+    // New function for incremental updates
+    const updateStatsIncrementally = (currentStats: Stats, newEvent: CopilotEvent): Stats => {
+        const newStats: Stats = {
+            ...currentStats,
+            totalRequests: currentStats.totalRequests + 1,
+            totalReqBytes: currentStats.totalReqBytes + newEvent.req_bytes,
+            totalRespBytes: currentStats.totalRespBytes + newEvent.resp_bytes,
+            models: { ...currentStats.models }, // Deep copy models
+        };
+
+        const modelName = newEvent.req_json?.model || newEvent.resp_json?.model || 'unknown';
+        const modelStats = newStats.models[modelName] ? { ...newStats.models[modelName] } : { count: 0, total: 0, prompt: 0, completion: 0, reasoning: 0, totalStreamingDuration: 0, streamingEventsCount: 0, completionTokensForTps: 0 };
+
+        modelStats.count++;
+
+        const usage = newEvent.resp_json?.usage;
+        const promptTokens = usage?.prompt_tokens ?? 0;
+        const completionTokens = usage?.completion_tokens ?? 0;
+        const reasoningTokens = usage?.reasoning_tokens ?? 0;
+        const totalTokens = usage?.total_tokens ?? (promptTokens + completionTokens + reasoningTokens);
+
+        modelStats.prompt += promptTokens;
+        modelStats.completion += completionTokens;
+        modelStats.reasoning += reasoningTokens;
+        modelStats.total += totalTokens;
+
+        if (newEvent.streaming_duration_s && newEvent.streaming_duration_s > 0) {
+            modelStats.totalStreamingDuration += newEvent.streaming_duration_s;
+            modelStats.streamingEventsCount++;
+            modelStats.completionTokensForTps += completionTokens;
+        }
+
+        newStats.models[modelName] = modelStats;
+
+        // Update global token counts
+        newStats.totalPromptTokens += promptTokens;
+        newStats.totalCompletionTokens += completionTokens;
+        newStats.totalReasoningTokens += reasoningTokens;
+        newStats.totalTokens += totalTokens;
+
+        // Recalculate averages
+        const totalLatency = (currentStats.averageLatency * currentStats.totalRequests) + (newEvent.latency_total_s || 0);
+        newStats.averageLatency = totalLatency / newStats.totalRequests;
+
+        const streamingEventsCount = Object.values(newStats.models).reduce((acc, m) => acc + m.streamingEventsCount, 0);
+        const totalStreamingDuration = Object.values(newStats.models).reduce((acc, m) => acc + m.totalStreamingDuration, 0);
+        newStats.averageStreamingDuration = streamingEventsCount > 0 ? totalStreamingDuration / streamingEventsCount : 0;
+
+        // This is a simplification; a true rolling average for TPS is more complex.
+        // For simplicity, we recalculate based on all events for now.
+        const tpsEvents = [...allEvents, newEvent].filter(e => e.output_tps && e.output_tps > 0);
+        const totalOutputTps = tpsEvents.reduce((acc, e) => acc + (e.output_tps || 0), 0);
+        newStats.averageOutputTps = tpsEvents.length > 0 ? totalOutputTps / tpsEvents.length : 0;
+
+        return newStats;
+    };
+
     // Moved outside useEffect to be accessible by both fetch and WebSocket
     const calculateStats = (events: CopilotEvent[]): Stats => {
         if (events.length === 0) return initialStats;
@@ -344,7 +401,7 @@ const HomePage: React.FC = () => {
             const usage = event.resp_json?.usage;
 
             // Handle different token structures
-            const promptTokens = usage?.prompt_tokens ?? event.req_json?.extra?.prompt_tokens ?? 0;
+            const promptTokens = usage?.prompt_tokens ?? 0;
             const completionTokens = usage?.completion_tokens ?? 0;
             const reasoningTokens = usage?.reasoning_tokens ?? 0;
             const totalTokens = usage?.total_tokens ?? (promptTokens + completionTokens + reasoningTokens);
@@ -377,7 +434,7 @@ const HomePage: React.FC = () => {
         for (const event of events) {
             const date = new Date(event.ts_end * 1000).toISOString().split('T')[0];
             const usage = event.resp_json?.usage;
-            const promptTokens = usage?.prompt_tokens ?? event.req_json?.extra?.prompt_tokens ?? 0;
+            const promptTokens = usage?.prompt_tokens ?? 0;
             const completionTokens = usage?.completion_tokens ?? 0;
             const reasoningTokens = usage?.reasoning_tokens ?? 0;
             const totalTokens = usage?.total_tokens ?? (promptTokens + completionTokens + reasoningTokens);
@@ -395,10 +452,14 @@ const HomePage: React.FC = () => {
     };
 
     useEffect(() => {
+        // Use environment variables for API and WebSocket URLs
+        const apiUrl = 'http://localhost:8000';
+        const wsUrl = 'ws://localhost:8000/ws';
+
         // --- 1. Fetch historical data on load ---
         const fetchHistory = async () => {
             try {
-                const response = await fetch('http://localhost:8000/history');
+                const response = await fetch(`${apiUrl}/history`);
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
@@ -415,7 +476,7 @@ const HomePage: React.FC = () => {
         fetchHistory();
 
         // --- 2. Connect WebSocket for real-time updates ---
-        const ws = new WebSocket('ws://localhost:8000/ws');
+        const ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
             console.log('WebSocket connection established');
@@ -425,12 +486,20 @@ const HomePage: React.FC = () => {
         ws.onmessage = (event) => {
             const newEvent: CopilotEvent = JSON.parse(event.data);
 
-            setAllEvents(prevEvents => {
-                const updatedEvents = [...prevEvents, newEvent];
-                // The calculateStats function is now more robust
-                setStats(calculateStats(updatedEvents));
-                setHeatmapData(processEventsForHeatmap(updatedEvents)); // Update heatmap
-                return updatedEvents;
+            // Incremental update
+            setAllEvents(prevEvents => [...prevEvents, newEvent]);
+            setStats(prevStats => updateStatsIncrementally(prevStats, newEvent));
+            setHeatmapData(prevData => {
+                const date = new Date(newEvent.ts_end * 1000).toISOString().split('T')[0];
+                const usage = newEvent.resp_json?.usage;
+                const totalTokens = usage?.total_tokens ?? (usage?.prompt_tokens ?? 0) + (usage?.completion_tokens ?? 0);
+                
+                const existingDate = prevData.find(d => d.date === date);
+                if (existingDate) {
+                    return prevData.map(d => d.date === date ? { ...d, count: d.count + totalTokens } : d);
+                } else {
+                    return [...prevData, { date, count: totalTokens }];
+                }
             });
         };
 
@@ -572,11 +641,14 @@ const HomePage: React.FC = () => {
 
                         {/* Token Usage */}
                         <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
-                            <div className="flex justify-between items-center bg-gray-700 p-4 rounded-t-lg">
+                            {/* Header: Title and Total Tokens on the same line */}
+                            <div className="flex justify-between items-center mb-4">
                                 <h3 className="text-white text-lg font-semibold">Token Usage Breakdown</h3>
-                                <span className="font-bold text-2xl text-white">{stats.totalTokens.toLocaleString()}</span>
+                                <span className="font-bold text-3xl text-white">{stats.totalTokens.toLocaleString()}</span>
                             </div>
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-gray-700 rounded-b-lg overflow-hidden">
+
+                            {/* Breakdown Grid */}
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-gray-700 rounded-lg overflow-hidden">
                                 <div className="bg-gray-800 p-4">
                                     <p className="text-sm text-blue-400">Input (Prompt)</p>
                                     <p className="text-xl font-semibold">{stats.totalPromptTokens.toLocaleString()}</p>

@@ -3,6 +3,7 @@ import json
 import logging
 import pathlib
 import os
+import queue
 from multiprocessing import Process, Queue
 
 import uvicorn
@@ -35,12 +36,15 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-def run_mitmproxy(queue: Queue):
+def run_mitmproxy(queue_instance: Queue):
     """Runs mitmproxy's DumpMaster in a separate process."""
     
     def on_event_callback(event_data):
-        """Callback to put event data (as a dictionary) into the shared queue."""
-        queue.put(event_data)
+        """Callback to put event data (as a dictionary) into the shared queue without blocking."""
+        try:
+            queue_instance.put_nowait(event_data)
+        except queue.Full:
+            logger.warning("Event queue is full. An event from mitmproxy was dropped.")
 
     async def start_proxy():
         opts = Options()
@@ -105,14 +109,10 @@ async def websocket_endpoint(websocket: WebSocket):
             if not event_queue.empty():
                 # Get the event dictionary from the queue
                 event_dict = event_queue.get()
+                
+                # The logger now handles file writing. We just send to the client.
                 event_json_str = json.dumps(event_dict, ensure_ascii=False)
-
-                with open(EVENTS_PATH, "a", encoding="utf-8") as f:
-                    f.write(event_json_str + "\n")
-
-                # Send to the WebSocket for real-time display
                 await websocket.send_text(event_json_str)
-
 
             await asyncio.sleep(0.1) # Prevent busy-waiting
     except WebSocketDisconnect:
