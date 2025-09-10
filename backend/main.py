@@ -7,6 +7,8 @@ from multiprocessing import Process, Queue
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from mitmproxy.tools.dump import DumpMaster
 from mitmproxy.options import Options
 
@@ -22,6 +24,16 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI()
 event_queue = Queue()
+mitm_process: Process | None = None
+
+# Add CORS middleware to allow requests from your frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 def run_mitmproxy(queue: Queue):
     """Runs mitmproxy's DumpMaster in a separate process."""
@@ -34,7 +46,6 @@ def run_mitmproxy(queue: Queue):
         opts = Options()
         opts.listen_host = '0.0.0.0'
         opts.listen_port = 8080
-        opts.web_host = '' 
         opts.allow_hosts = [".*githubcopilot\\.com"]
         
         master = DumpMaster(opts)
@@ -48,9 +59,41 @@ def run_mitmproxy(queue: Queue):
 @app.on_event("startup")
 async def startup_event():
     """Start the mitmproxy process on server startup."""
+    global mitm_process
     mitm_process = Process(target=run_mitmproxy, args=(event_queue,))
     mitm_process.start()
     logger.info("mitmproxy process started.")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the mitmproxy process on server shutdown."""
+    global mitm_process
+    if mitm_process and mitm_process.is_alive():
+        logger.info("Terminating mitmproxy process.")
+        mitm_process.terminate()
+        mitm_process.join()
+        logger.info("mitmproxy process terminated.")
+
+@app.get("/history", response_model=list[dict])
+async def get_history():
+    """Reads and returns all historical events from the events.jsonl file."""
+    if not EVENTS_PATH.exists():
+        return []
+    
+    events = []
+    try:
+        with open(EVENTS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning(f"Skipping malformed line in events.jsonl: {line.strip()}")
+        return events
+    except Exception as e:
+        logger.error(f"Error reading history file: {e}")
+        return JSONResponse(content={"error": "Could not read history file"}, status_code=500)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -69,7 +112,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # Send to the WebSocket for real-time display
                 await websocket.send_text(event_json_str)
-                
+
 
             await asyncio.sleep(0.1) # Prevent busy-waiting
     except WebSocketDisconnect:
@@ -78,4 +121,4 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket Error: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, lifespan="on", loop="asyncio")

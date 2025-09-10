@@ -5,3 +5,5 @@
 copilot_mitm
 
 node_modules
+
+__pycache__/

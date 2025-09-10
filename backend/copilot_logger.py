@@ -55,22 +55,35 @@ def _summarize_req_json(data: Optional[dict]) -> Optional[dict]:
         return data
     
     summary = data.copy()
+
+    # Handle chat-like requests with "messages"
     if "messages" in summary and isinstance(summary["messages"], list):
         new_messages = []
         for msg in summary["messages"]:
             if isinstance(msg, dict) and "content" in msg and isinstance(msg.get("content"), str):
                 new_msg = msg.copy()
-                new_msg["content"] = new_msg["content"][:200]
+                new_msg["content"] = new_msg["content"][:200] + "..."
                 new_messages.append(new_msg)
             else:
                 new_messages.append(msg)
         summary["messages"] = new_messages
-    
-    if "prediction" in summary and isinstance(summary["prediction"], dict):
-        if "content" in summary["prediction"] and isinstance(summary["prediction"].get("content"), str):
-            new_prediction = summary["prediction"].copy()
-            new_prediction["content"] = new_prediction["content"][:200]
-            summary["prediction"] = new_prediction
+
+    # Handle completion-like requests with "prompt"
+    if "prompt" in summary and isinstance(summary.get("prompt"), str):
+        summary["prompt"] = summary["prompt"][:200] + "..."
+
+    # Handle "extra" data which can contain large context
+    if "extra" in summary and isinstance(summary.get("extra"), dict):
+        new_extra = summary["extra"].copy()
+        if "context" in new_extra and isinstance(new_extra.get("context"), list):
+            new_context = []
+            for item in new_extra["context"]:
+                if isinstance(item, str) and len(item) > 200:
+                    new_context.append(item[:200] + "...")
+                else:
+                    new_context.append(item)
+            new_extra["context"] = new_context
+        summary["extra"] = new_extra
         
     return summary
 
@@ -88,34 +101,11 @@ def _summarize_resp_json(data: Optional[dict]) -> Optional[dict]:
                 if "message" in new_choice and isinstance(new_choice["message"], dict):
                     new_message = new_choice["message"].copy()
                     if "content" in new_message and isinstance(new_message.get("content"), str):
-                        new_message["content"] = new_message["content"][:200]
+                        new_message["content"] = new_message["content"][:200] + "..."
                     new_choice["message"] = new_message
                 new_choices.append(new_choice)
             else:
                 new_choices.append(choice)
-        summary["choices"] = new_choices
-
-    return summary
-
-def _summarize_resp_json(data: Optional[dict]) -> Optional[dict]:
-    """Removes large message content from response JSON to save space."""
-    if not data or not isinstance(data, dict):
-        return data
-
-    summary = data.copy()
-    if "choices" in summary and isinstance(summary["choices"], list):
-        new_choices = []
-        for choice in summary["choices"]:
-            if isinstance(choice, dict):
-                new_choice = choice.copy()
-                if "message" in new_choice and isinstance(new_choice["message"], dict):
-                    # Create a new message dict without the 'content'
-                    new_choice["message"] = {
-                        k: v for k, v in new_choice["message"].items() if k != "content"
-                    }
-                new_choices.append(new_choice)
-            else:
-                new_choices.append(choice)  # Keep non-dict choices as is
         summary["choices"] = new_choices
 
     return summary
@@ -239,9 +229,9 @@ class CopilotLogger:
 
         ttfb = _safe_float((t_resp_start - t_req) if (t_resp_start and t_req) else None)
         latency_total = _safe_float((t_resp_end - t_req) if (t_resp_end and t_req) else None)
+        streaming_duration_s = _safe_float((t_resp_end - t_resp_start) if (t_resp_end and t_resp_start) else None)
 
         # Sizes
-        req_bytes = len(flow.request.raw_content or b"")
         req_bytes = len(flow.request.raw_content or b"")
         # If we streamed SSE, raw_content may be empty—use counter
         is_sse = "sse_chunks" in flow.metadata
@@ -263,8 +253,14 @@ class CopilotLogger:
         elif "application/json" in resp_ct:
             final_resp_json = _safe_json(flow.response.raw_content)
 
-        # Extract token usage if available
-        usage = (final_resp_json or {}).get("usage") or {}
+        # Calculate output speed in Tokens Per Second (t/s)
+        completion_tokens = None
+        output_tps = None
+        if final_resp_json and isinstance(final_resp_json.get("usage"), dict):
+            completion_tokens = final_resp_json["usage"].get("completion_tokens")
+        
+        if completion_tokens is not None and streaming_duration_s is not None and streaming_duration_s > 1e-9:
+            output_tps = completion_tokens / streaming_duration_s
 
         # Decide what to save based on config
         req_json_to_save = req_json_full if SAVE_BODIES else _summarize_req_json(req_json_full)
@@ -279,13 +275,12 @@ class CopilotLogger:
             "status": flow.response.status_code,
             "ttfb_s": ttfb,
             "latency_total_s": latency_total,
+            "streaming_duration_s": streaming_duration_s,
             "req_bytes": req_bytes,
             "resp_bytes": resp_bytes,
+            "output_tps": output_tps,
             "req_ct": req_ct,
             "resp_ct": resp_ct,
-            "prompt_tokens": usage.get("prompt_tokens"),
-            "completion_tokens": usage.get("completion_tokens"),
-            "total_tokens": usage.get("total_tokens"),
             "req_json": req_json_to_save,
             "resp_json": resp_json_to_save,
         }
@@ -300,7 +295,7 @@ class CopilotLogger:
         ctx.log.info(
             f"[Copilot] {flow.request.method} {flow.request.host}{flow.request.path} -> {flow.response.status_code} | "
             f"total: {latency_total or 0:.2f}s, ttfb: {ttfb or 0:.2f}s, "
-            f"req: {req_bytes}b, resp: {resp_bytes}b, tokens: {usage.get('total_tokens', 'N/A')}"
+            f"req: {req_bytes}b, resp: {resp_bytes}b, speed: {output_tps or 0:.2f} t/s"
         )
 
 addons = [CopilotLogger()]
